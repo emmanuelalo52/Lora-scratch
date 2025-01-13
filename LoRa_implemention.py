@@ -8,13 +8,65 @@ import torch.nn.functional as F
 from typing import Optional,List
 
 class LoraLayer(nn.Module):
-    def __init__(self,rank,alpha,lora_weight,bias=False,dropout=0.1):
+    def __init__(self,rank,alpha,lora_weight,base_layer,dropout=0.1):
         super().__init__()
         self.rank = rank
         self.dropout = dropout
         self.alpha = alpha
         self.lora_weight = lora_weight
-        self.bias = bias
+        self.base_layer = base_layer
+
+        #Initialize scaling
+        self.scaling = self.alpha/self.rank
+        if isinstance(base_layer, nn.Linear):
+            self.in_features = base_layer.in_features
+            self.out_features = base_layer.out_features
+        elif isinstance(base_layer, nn.Embedding):
+            self.fan_in = base_layer.num_embeddings
+            self.fan_out = base_layer.embedding_dim
+        else:
+            raise ValueError("Unsupported base layer type. Only nn.Linear and nn.Embedding are supported.")
+        
+        self.lora_A = nn.Parameter(self.weight.new_zeros((self.fan_in, rank)))
+        self.lora_B = nn.Parameter(self.weight.new_zeros((rank, self.fan_out)))
+
+        #reset parameters
+        self.reset_parameters()
+    def reset_parameters(self):
+        if self.rank > 0:
+            nn.init.normal_(self.lora_A,mean=0,std=0.02)
+            nn.init.zeros_(self.lora_B)
+
+
+    def merge_weights(self):
+        if self.merge_weights and not self.merged:
+            if self.rank > 0:
+                # LoRA B * LoRA A (Matrix multiplication)
+                lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
+                self.weight.data += lora_adaptor
+                self.merged = True
+
+    def unmerge_weights(self):
+        if self.merge_weights and self.merged:
+            if self.rank > 0:
+                # LoRA B * LoRA A (Matrix multiplication)
+                lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
+                self.weight.data -= lora_adaptor
+                self.merged = False
+    def forward(self,x):
+        result = self.base_layer(x)
+
+        # Add LoRA adaptation if rank > 0 and weights are not merged
+        if self.rank > 0 and not self.merged:
+            if isinstance(self.base_layer, nn.Linear):
+                lora_adaptation = (x @ self.lora_A) @ self.lora_B  # LoRA adaptation for Linear
+            elif isinstance(self.base_layer, nn.Embedding):
+                lora_adaptation = F.embedding(x, self.lora_A.transpose(0, 1)) @ self.lora_B  # LoRA adaptation for Embedding
+            else:
+                raise ValueError("Unsupported base layer type.")
+            result += lora_adaptation * self.scaling  # Scale and add to result
+
+        return result
 class Embedding(nn.Module):
     def __init__(self, vocab_size, embed_dim, rank, alpha=1, merge_weights=True,
                  padding_idx=None, max_norm=None, norm_type=2, scale_grad_by_freq=False, sparse=False):
@@ -82,7 +134,7 @@ class Embedding(nn.Module):
         else:
             return nn.Embedding.forward(self, x)     
 class LinearWithLoRA(nn.Module):
-    def __init__(self, fan_in, fan_out, rank=8, alpha=1.0, bias=True, merge_weights=True):
+    def __init__(self, fan_in, fan_out, rank, alpha=1, bias=True, merge_weights=True):
         super().__init__()
         self.fan_in = fan_in
         self.fan_out = fan_out

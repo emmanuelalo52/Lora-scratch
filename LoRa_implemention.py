@@ -154,7 +154,7 @@ class LinearWithLoRA(nn.Module):
         self.rank = rank
         self.alpha = alpha
         self.merge_weights = merge_weights
-        self.scaling = alpha / rank  
+        self.scaling = alpha / rank
 
         # Initialize main weight matrix
         self.weight = nn.Parameter(torch.empty((fan_in, fan_out)))

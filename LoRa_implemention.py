@@ -8,52 +8,62 @@ import torch.nn.functional as F
 from typing import Optional,List
 
 class LoraLayer(nn.Module):
-    def __init__(self,rank,alpha,lora_weight,base_layer,dropout=0.1):
+    def __init__(self, rank, alpha, base_layer, merge_weights=True, dropout=0.1):
         super().__init__()
         self.rank = rank
-        self.dropout = dropout
         self.alpha = alpha
-        self.lora_weight = lora_weight
+        self.dropout = dropout
         self.base_layer = base_layer
+        self.merge_weights = merge_weights
 
-        #Initialize scaling
-        self.scaling = self.alpha/self.rank
+        # Initialize scaling
+        self.scaling = self.alpha / self.rank
+
+        # Get the shape of the base layer's weight matrix
         if isinstance(base_layer, nn.Linear):
             self.in_features = base_layer.in_features
             self.out_features = base_layer.out_features
         elif isinstance(base_layer, nn.Embedding):
-            self.fan_in = base_layer.num_embeddings
-            self.fan_out = base_layer.embedding_dim
+            self.in_features = base_layer.num_embeddings
+            self.out_features = base_layer.embedding_dim
         else:
             raise ValueError("Unsupported base layer type. Only nn.Linear and nn.Embedding are supported.")
-        
-        self.lora_A = nn.Parameter(self.weight.new_zeros((self.fan_in, rank)))
-        self.lora_B = nn.Parameter(self.weight.new_zeros((rank, self.fan_out)))
 
-        #reset parameters
+        # Initialize LoRA matrices
+        if rank > 0:
+            self.lora_A = nn.Parameter(torch.zeros((self.in_features, rank)))  # LoRA A matrix
+            self.lora_B = nn.Parameter(torch.zeros((rank, self.out_features)))  # LoRA B matrix
+        else:
+            self.lora_A = None
+            self.lora_B = None
+
+        # Track whether weights are merged
+        self.merged = False
+
+        # Initialize parameters
         self.reset_parameters()
+
     def reset_parameters(self):
         if self.rank > 0:
-            nn.init.normal_(self.lora_A,mean=0,std=0.02)
+            nn.init.normal_(self.lora_A, mean=0, std=0.02)
             nn.init.zeros_(self.lora_B)
 
-
     def merge_weights(self):
-        if self.merge_weights and not self.merged:
-            if self.rank > 0:
-                # LoRA B * LoRA A (Matrix multiplication)
-                lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
-                self.weight.data += lora_adaptor
-                self.merged = True
+        if self.merge_weights and not self.merged and self.rank > 0:
+            # LoRA B * LoRA A (Matrix multiplication)
+            lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
+            self.base_layer.weight.data += lora_adaptor
+            self.merged = True
 
     def unmerge_weights(self):
-        if self.merge_weights and self.merged:
-            if self.rank > 0:
-                # LoRA B * LoRA A (Matrix multiplication)
-                lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
-                self.weight.data -= lora_adaptor
-                self.merged = False
-    def forward(self,x):
+        if self.merge_weights and self.merged and self.rank > 0:
+            # LoRA B * LoRA A (Matrix multiplication)
+            lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
+            self.base_layer.weight.data -= lora_adaptor
+            self.merged = False
+
+    def forward(self, x):
+        # Forward pass through the base layer
         result = self.base_layer(x)
 
         # Add LoRA adaptation if rank > 0 and weights are not merged
@@ -64,7 +74,13 @@ class LoraLayer(nn.Module):
                 lora_adaptation = F.embedding(x, self.lora_A.transpose(0, 1)) @ self.lora_B  # LoRA adaptation for Embedding
             else:
                 raise ValueError("Unsupported base layer type.")
-            result += lora_adaptation * self.scaling  # Scale and add to result
+
+            # Apply dropout to the LoRA adaptation
+            if self.dropout > 0:
+                lora_adaptation = F.dropout(lora_adaptation, p=self.dropout, training=self.training)
+
+            # Scale and add to result
+            result += lora_adaptation * self.scaling
 
         return result
 class Embedding(nn.Module):
@@ -87,8 +103,8 @@ class Embedding(nn.Module):
 
         # Initialize LoRA adapters
         assert rank > 0
-        self.lora_A = nn.Parameter(self.weight.new_zeros((vocab_size, rank)))
-        self.lora_B = nn.Parameter(self.weight.new_zeros((rank, embed_dim)))
+        self.lora_A = nn.Parameter(torch.zeros((vocab_size, rank)))  # LoRA A matrix
+        self.lora_B = nn.Parameter(torch.zeros((rank, embed_dim)))  # LoRA B matrix
 
         # Scaling factor
         self.scaling = self.alpha / self.rank
@@ -124,15 +140,12 @@ class Embedding(nn.Module):
         if self.rank > 0 and not self.merged:
             if not isinstance(x, torch.Tensor):
                 raise TypeError(f"Input must be a torch.Tensor, got {type(x)}")
+            #nn.Embedding.forward(self, x)
             x_emb = self.weight[x]
-            after_A = F.embedding(
-                x, self.lora_A.transpose(0, 1), self.padding_idx, self.max_norm,
-                self.norm_type, self.scale_grad_by_freq, self.sparse
-            )
-            x_emb += (after_A @ self.lora_B.transpose(0, 1)) * self.scaling
+            if self.rank > 0 and not self.merged:
+                after_A = x @ self.lora_A  # Direct matrix multiplication
+                x_emb += (after_A @ self.lora_B) * self.scaling
             return x_emb
-        else:
-            return nn.Embedding.forward(self, x)     
 class LinearWithLoRA(nn.Module):
     def __init__(self, fan_in, fan_out, rank, alpha=1, bias=True, merge_weights=True):
         super().__init__()
@@ -141,34 +154,40 @@ class LinearWithLoRA(nn.Module):
         self.rank = rank
         self.alpha = alpha
         self.merge_weights = merge_weights
-        self.scaling = alpha / rank
+        self.scaling = alpha / rank  
 
-        #initialize weight
-        self.weight = nn.Parameter(torch.empty((fan_in,fan_out)))
+        # Initialize main weight matrix
+        self.weight = nn.Parameter(torch.empty((fan_in, fan_out)))
 
-        #initialize bias too
-        if bias is not None:
+        # Initialize bias
+        if bias:
             self.bias = nn.Parameter(torch.zeros(fan_out))
         else:
             self.bias = None
-        if self.rank > 0:
-            self.lora_A = nn.Parameter(torch.zeros((fan_in,rank)))
-            self.lora_B = nn.Parameter(torch.zeros((rank,fan_out)))
+
+        # Initialize LoRA matrices
+        if rank > 0:
+            self.lora_A = nn.Parameter(torch.zeros((fan_in, rank)))  # LoRA A matrix
+            self.lora_B = nn.Parameter(torch.zeros((rank, fan_out)))  # LoRA B matrix
         else:
             self.lora_A = None
             self.lora_B = None
-        #track merging
+
+        # Track whether weights are merged
         self.merged = False
 
+        # Initialize parameters
         self.reset_parameters()
+
     def reset_parameters(self):
         # Initialize main weight matrix
-        nn.init.normal_(self.weight, mean=0, std=1 / math.sqrt(self.in_features))
+        nn.init.normal_(self.weight, mean=0, std=1 / math.sqrt(self.fan_in))
 
         # Initialize LoRA matrices
         if self.rank > 0:
             nn.init.normal_(self.lora_A, mean=0, std=0.02)
             nn.init.zeros_(self.lora_B)
+
     def merge_weights(self):
         if self.merge_weights and not self.merged and self.rank > 0:
             # LoRA B * LoRA A (Matrix multiplication)
@@ -182,11 +201,18 @@ class LinearWithLoRA(nn.Module):
             lora_adaptor = (self.lora_B @ self.lora_A) * self.scaling
             self.weight.data -= lora_adaptor
             self.merged = False
-    def forward(self,x):
+
+    def forward(self, x):
+        # Standard linear transformation
         result = x @ self.weight
+
+        # Add LoRA adaptation if rank > 0 and weights are not merged
         if self.rank > 0 and not self.merged:
-            lora_adaptator = (x @ self.lora_A) @ self.lora_B  # LoRA adaptator
-            result += lora_adaptator * self.scaling  # Scale and add to result
+            lora_adaptation = (x @ self.lora_A) @ self.lora_B  # LoRA adaptation
+            result += lora_adaptation * self.scaling  # Scale and add to result
+
+        # Add bias
         if self.bias is not None:
             result += self.bias
+
         return result

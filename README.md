@@ -238,10 +238,3 @@ Contributions are welcome! Areas of interest:
 
 This project is licensed under the MIT License.
 
-## References
-
-1. Original LoRA Paper: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
-2. Implementation inspired by the mathematical foundations in `Lora math.pdf`
-3. PyTorch documentation and best practices
-
-Would you like me to expand on any particular section or provide more specific examples?
